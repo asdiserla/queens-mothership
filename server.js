@@ -16,6 +16,9 @@ const THING_IDS = (process.env.THING_IDS || "")
 const ARDUINO_CLIENT_ID = process.env.ARDUINO_CLIENT_ID || "";
 const ARDUINO_CLIENT_SECRET = process.env.ARDUINO_CLIENT_SECRET || "";
 
+const SPACE_ID = process.env.SPACE_ID || "";
+const API_BASE = "https://api2.arduino.cc/iot";
+
 // ---- In-memory state (for debugging/demo) ----
 const mem = {
   bees: {}, // thingId -> { lastSeen, ldr_value, lastCloudState, lastWriteOk, lastError }
@@ -47,8 +50,20 @@ function hasCredentials() {
   return ARDUINO_CLIENT_ID.length > 0 && ARDUINO_CLIENT_SECRET.length > 0;
 }
 
+function hasSpace() {
+  return SPACE_ID.length > 0;
+}
+
+function orgHeaders(token) {
+  return {
+    Authorization: `Bearer ${token}`,
+    "X-Organization": SPACE_ID,
+  };
+}
+
 async function getAccessToken() {
   if (!hasCredentials()) throw new Error("Missing ARDUINO_CLIENT_ID/ARDUINO_CLIENT_SECRET");
+  if (!hasSpace()) throw new Error("Missing SPACE_ID (required for shared-space Things)");
 
   const now = Date.now();
   if (tokenCache.token && now < tokenCache.exp) return tokenCache.token;
@@ -57,10 +72,11 @@ async function getAccessToken() {
     grant_type: "client_credentials",
     client_id: ARDUINO_CLIENT_ID,
     client_secret: ARDUINO_CLIENT_SECRET,
-    audience: "https://api2.arduino.cc/iot",
+    audience: API_BASE,
+    organization_id: SPACE_ID
   });
 
-  const res = await fetch("https://api2.arduino.cc/iot/v1/clients/token", {
+  const res = await fetch(`${API_BASE}/v1/clients/token`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body,
@@ -79,8 +95,8 @@ async function getAccessToken() {
 }
 
 async function listThingProperties(thingId, token) {
-  const res = await fetch(`https://api2.arduino.cc/iot/v2/things/${thingId}/properties`, {
-    headers: { Authorization: `Bearer ${token}` },
+  const res = await fetch(`${API_BASE}/v2/things/${thingId}/properties`, {
+    headers: orgHeaders(token), // FIX: include X-Organization
   });
   if (!res.ok) {
     const txt = await res.text();
@@ -93,9 +109,24 @@ function propValue(p) {
   return (p.last_value !== undefined ? p.last_value : (p.value !== undefined ? p.value : null));
 }
 
+function buildPropIndex(props) {
+  // Prefer variable_name (matches your sketch identifiers), but fallback to name.
+  const byVar = new Map();
+  const byName = new Map();
+
+  for (const p of props) {
+    if (p.variable_name) byVar.set(p.variable_name, p);
+    if (p.name) byName.set(p.name, p);
+  }
+
+  // Special-case: you have name "YouAreTheQueen" but variable_name "youAreTheQueen"
+  // With byVar-first, publishing with "youAreTheQueen" will still work.
+  return { byVar, byName };
+}
+
 async function readState(thingId) {
-  // If no credentials yet, return a mocked shape so you can still develop endpoints
-  if (!hasCredentials()) {
+  if (!hasCredentials() || !hasSpace()) {
+    // Mock so you can still run the server without creds in dev
     return {
       ldr_value: mem.bees[thingId]?.ldr_value ?? Math.floor(Math.random() * 1024),
       led_count: 0,
@@ -103,15 +134,19 @@ async function readState(thingId) {
       isBlinking: false,
       ledcolor: true,
       youAreTheQueen: false,
-      _mock: true
+      _mock: true,
     };
   }
 
   const token = await getAccessToken();
   const props = await listThingProperties(thingId, token);
 
+  // FIX: map using variable_name when available (more stable than name)
   const state = {};
-  for (const p of props) state[p.name] = propValue(p);
+  for (const p of props) {
+    const key = p.variable_name || p.name;
+    state[key] = propValue(p);
+  }
   return state;
 }
 
@@ -121,20 +156,23 @@ function clampInt(n, min, max) {
   return Math.max(min, Math.min(max, x));
 }
 
-// Publish a single property value by name
-async function publishByName(thingId, name, value) {
-  if (!hasCredentials()) return { ok: true, mocked: true };
+async function publishByKey(thingId, key, value) {
+  if (!hasCredentials() || !hasSpace()) return { ok: true, mocked: true };
 
   const token = await getAccessToken();
   const props = await listThingProperties(thingId, token);
-  const match = props.find(p => p.name === name);
-  if (!match) throw new Error(`Unknown property "${name}" on thing ${thingId}`);
+  const { byVar, byName } = buildPropIndex(props);
 
-  const url = `https://api2.arduino.cc/iot/v2/things/${thingId}/properties/${match.id}/publish`;
+  const match = byVar.get(key) || byName.get(key);
+  if (!match) {
+    throw new Error(`Unknown property "${key}" on thing ${thingId} (checked variable_name + name)`);
+  }
+
+  const url = `${API_BASE}/v2/things/${thingId}/properties/${match.id}/publish`;
   const res = await fetch(url, {
     method: "PUT",
     headers: {
-      Authorization: `Bearer ${token}`,
+      ...orgHeaders(token),               // FIX: include X-Organization
       "content-type": "application/json",
     },
     body: JSON.stringify({ value }),
@@ -142,24 +180,23 @@ async function publishByName(thingId, name, value) {
 
   if (!res.ok) {
     const txt = await res.text();
-    throw new Error(`Publish failed (${thingId}.${name}): ${res.status} ${txt}`);
+    throw new Error(`Publish failed (${thingId}.${key}): ${res.status} ${txt}`);
   }
   return { ok: true };
 }
 
+
 // ---- Decision logic (surplus/low light + queen) ----
 function computeGlobal(beesStates) {
   const values = beesStates
-    .map(b => b.ldr_value)
-    .filter(v => typeof v === "number" && !Number.isNaN(v));
+    .map((b) => b.ldr_value)
+    .filter((v) => typeof v === "number" && !Number.isNaN(v));
 
   const avg = values.length ? values.reduce((a, b) => a + b, 0) / values.length : null;
 
-  // Thresholds: adjust later. LDR typically 0..1023
   const LOW_LIGHT_THRESHOLD = 200;
   const lowLight = avg !== null ? avg < LOW_LIGHT_THRESHOLD : null;
 
-  // Queen: bee with max light (placeholder but deterministic)
   let queenThingId = null;
   let max = -Infinity;
   for (const b of beesStates) {
@@ -179,23 +216,18 @@ function computeGlobal(beesStates) {
 
 function makeOutputsForBee(global, thingId) {
   const isQueen = global.queenThingId === thingId;
-
-  // Blink if low light
   const isBlinking = global.lowLight === true;
 
-  // LED count proportional to avgLight
   let led_count = 0;
   if (typeof global.avgLight === "number") {
     led_count = clampInt(Math.round((global.avgLight / 1023) * 12), 0, 12) ?? 0;
   }
 
-  // Color: green if queen, otherwise red
   const ledcolor = isQueen ? true : false;
 
-  // Servo speed: faster when low light (just for visible demo)
-  let servo_speed = isBlinking ? 80 : 20;
+  // Servo range should be 0..180 (matches your Servo attach pulse range use)
+  const servo_speed = isBlinking ? 140 : 40;
 
-  // youAreTheQueen only true on queen
   const youAreTheQueen = isQueen;
 
   return { isBlinking, led_count, ledcolor, servo_speed, youAreTheQueen };
@@ -224,13 +256,13 @@ async function syncOnce() {
   const global = computeGlobal(beesStates);
   mem.global = { ...global, updatedAt: new Date().toISOString() };
 
-  // Write outputs back
   for (const thingId of THING_IDS) {
     try {
       const out = makeOutputsForBee(global, thingId);
 
+      // FIX: publish by "key" which matches variable_name (youAreTheQueen will work)
       for (const [k, v] of Object.entries(out)) {
-        await publishByName(thingId, k, v);
+        await publishByKey(thingId, k, v);
       }
 
       mem.bees[thingId].lastWriteOk = new Date().toISOString();
@@ -247,7 +279,7 @@ let loopTimer = null;
 function startLoop() {
   if (loopTimer) return;
   loopTimer = setInterval(() => {
-    syncOnce().catch(e => {
+    syncOnce().catch((e) => {
       mem.lastSync = { at: new Date().toISOString(), ok: false, error: String(e.message ?? e) };
     });
   }, POLL_MS);
@@ -259,36 +291,34 @@ function stopLoop() {
 }
 
 // ---- Routes ----
-app.get("/", (req, res) => res.send("Queens mothership is running ✅"));
+app.get("/", (req, res) => res.send("Queens mothership is running"));
 
-app.get("/health", (req, res) => {
+app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     time: new Date().toISOString(),
     things: THING_IDS,
     hasCredentials: hasCredentials(),
+    hasSpace: hasSpace(),
     pollingMs: POLL_MS,
     polling: Boolean(loopTimer),
   });
 });
 
-// Full debug state
-app.get("/state", (req, res) => {
-  // online if lastSeen within 10 seconds
+app.get("/state", (_req, res) => {
   const now = Date.now();
   const bees = {};
   for (const [thingId, b] of Object.entries(mem.bees)) {
     const lastSeenMs = b.lastSeen ? Date.parse(b.lastSeen) : 0;
     bees[thingId] = {
       ...b,
-      online: lastSeenMs ? (now - lastSeenMs) < 10_000 : false,
+      online: lastSeenMs ? now - lastSeenMs < 10_000 : false,
     };
   }
   res.json({ ...mem, bees });
 });
 
-// Force one sync cycle (useful for testing)
-app.post("/sync", async (req, res) => {
+app.post("/sync", async (_req, res) => {
   try {
     const out = await syncOnce();
     res.json(out);
@@ -297,7 +327,6 @@ app.post("/sync", async (req, res) => {
   }
 });
 
-// Manual override for a bee (for demo)
 app.patch("/bee/:thingId", async (req, res) => {
   const { thingId } = req.params;
   if (!THING_IDS.includes(thingId)) {
@@ -309,10 +338,9 @@ app.patch("/bee/:thingId", async (req, res) => {
     return res.status(400).json({ error: "ldr_value is read-only" });
   }
 
-  // Validation
   if ("led_count" in updates) {
     const v = clampInt(updates.led_count, 0, 12);
-    if (v === null) return res.status(400).json({ error: "led_count must be int" });
+    if (v === null) return res.status(400).json({ error: "led_count must be int (0–12)" });
     updates.led_count = v;
   }
   if ("servo_speed" in updates) {
@@ -323,7 +351,7 @@ app.patch("/bee/:thingId", async (req, res) => {
 
   try {
     for (const [k, v] of Object.entries(updates)) {
-      await publishByName(thingId, k, v);
+      await publishByKey(thingId, k, v);
     }
     res.json({ ok: true, thingId, updates });
   } catch (e) {
@@ -331,12 +359,11 @@ app.patch("/bee/:thingId", async (req, res) => {
   }
 });
 
-// Start/stop polling
-app.post("/polling/start", (req, res) => {
+app.post("/polling/start", (_req, res) => {
   startLoop();
   res.json({ ok: true, polling: true });
 });
-app.post("/polling/stop", (req, res) => {
+app.post("/polling/stop", (_req, res) => {
   stopLoop();
   res.json({ ok: true, polling: false });
 });
